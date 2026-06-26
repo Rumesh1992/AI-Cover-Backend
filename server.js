@@ -8,7 +8,13 @@ import mammoth from 'mammoth';
 
 import connectDB from './config/db.js';
 import ResumeHistory from './models/ResumeHistory.js';
-
+import {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+} from 'docx';
+import InterviewHistory from './models/InterviewHistory.js';
 dotenv.config();
 
 connectDB();
@@ -35,7 +41,206 @@ app.get('/api/health', (req, res) => {
     message: 'API running',
   });
 });
+app.post('/api/resume/download-docx', async (req, res) => {
+  try {
+    const { content } = req.body;
 
+    const doc = new Document({
+      sections: [
+        {
+          children: content.split('\n').map(
+            (line) =>
+              new Paragraph({
+                children: [
+                  new TextRun({
+                    text: line,
+                  }),
+                ],
+              }),
+          ),
+        },
+      ],
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    );
+
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename=ATS-Optimized-Resume.docx',
+    );
+
+    res.send(buffer);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: 'DOCX generation failed',
+    });
+  }
+});
+
+app.post('/api/interview/generate', async (req, res) => {
+  try {
+    const { targetRole, resumeText, jobDescription } = req.body;
+
+    if (!resumeText || !jobDescription) {
+      return res.status(400).json({
+        message: 'Resume text and job description are required',
+      });
+    }
+
+    const response = await client.responses.create({
+      model: 'gpt-5.4-mini',
+      input: `
+You are a senior technical interviewer and career coach.
+
+Target role:
+${targetRole || 'Software Engineer'}
+
+Candidate resume:
+${resumeText}
+
+Job description:
+${jobDescription}
+
+Generate interview questions tailored to this candidate and job.
+
+Return ONLY valid JSON in this exact structure:
+
+{
+  "reactQuestions": [],
+  "typescriptQuestions": [],
+  "systemDesignQuestions": [],
+  "behavioralQuestions": [],
+  "roleSpecificQuestions": []
+}
+
+Rules:
+- Each array must contain 5 questions.
+- Questions must be practical and job-relevant.
+- Include questions based on technologies found in resume and job description.
+- Do not include explanations outside JSON.
+- Do not wrap JSON in markdown.
+`,
+    });
+
+    const aiText = response.output_text?.trim();
+
+    if (!aiText) {
+      return res.status(500).json({
+        message: 'Empty AI response',
+      });
+    }
+
+    const parsedResult = JSON.parse(aiText);
+
+    return res.json(parsedResult);
+  } catch (error) {
+    console.error('Interview question generation failed:', error);
+
+    return res.status(500).json({
+      message: 'Interview question generation failed',
+    });
+  }
+});
+
+app.post('/api/resume/rewrite', async (req, res) => {
+  try {
+    const { targetRole, resumeText, jobDescription, resumeTemplate } = req.body;
+
+    if (!resumeText || !jobDescription) {
+      return res.status(400).json({
+        message: 'Resume text and job description are required',
+      });
+    }
+
+    const templateStyle = resumeTemplate || 'ats';
+
+    const response = await client.responses.create({
+      model: 'gpt-5.4-mini',
+      input: `
+You are an expert ATS resume writer and senior technical recruiter.
+
+Target role:
+${targetRole || 'Software Engineer'}
+
+Resume template style:
+${templateStyle}
+
+Template rules:
+- ats: Simple ATS-friendly format with clear headings, clean structure, and no graphics.
+- modern: Clean modern format with stronger wording, concise sections, and recruiter-friendly readability.
+- executive: Leadership-focused format with strategic impact, senior tone, ownership, delivery, and business value.
+- techlead: Technical leadership format emphasizing architecture, mentoring, code quality, scalability, delivery, and engineering practices.
+
+Current resume:
+${resumeText}
+
+Job description:
+${jobDescription}
+
+Task:
+Rewrite the resume to better match the job description while keeping it truthful and based ONLY on the provided resume.
+
+Very important rules:
+- Use ONLY information from the provided resume.
+- Do NOT invent fake companies, fake projects, fake degrees, fake certifications, fake metrics, or fake experience.
+- Preserve real company names, project names, job titles, technologies, and dates if they exist in the resume.
+- Do NOT replace real experience with generic placeholders like "5 years of experience".
+- Improve ATS keyword alignment using the job description only when it is truthful.
+- Improve wording, structure, bullet points, and professional tone.
+- Do not summarize responsibilities.
+- Expand existing experience into strong ATS-style resume bullet points.
+- Each Work Experience section should contain 5-8 detailed, achievement-oriented bullet points when enough information is available.
+- Each Project section should contain 3-5 detailed bullet points when enough information is available.
+- Avoid generic statements such as "Worked on applications", "Built web applications", or "Collaborated with teams".
+- Prefer technology-specific and achievement-oriented bullets.
+- If template style is "executive", emphasize leadership, business value, stakeholder collaboration, ownership, and delivery impact.
+- If template style is "techlead", emphasize architecture, mentoring, code quality, technical decisions, scalability, and engineering practices.
+- If template style is "modern", use concise, polished wording and avoid overly long bullet points.
+- If template style is "ats", prioritize ATS keywords, simple formatting, and clear section headings.
+- Keep the resume concise, clear, and recruiter-friendly.
+- If Education or Certifications are not provided, omit that section completely.
+- Return ONLY the rewritten resume text. Do not include explanations.
+
+Required output format:
+
+PROFESSIONAL SUMMARY
+
+TECHNICAL SKILLS
+
+WORK EXPERIENCE
+
+PROJECTS
+
+EDUCATION & CERTIFICATIONS
+`,
+    });
+
+    const rewrittenResume = response.output_text?.trim();
+
+    if (!rewrittenResume) {
+      return res.status(500).json({
+        message: 'Empty AI response',
+      });
+    }
+
+    return res.json({
+      rewrittenResume,
+    });
+  } catch (error) {
+    console.error('Resume rewrite failed:', error);
+
+    return res.status(500).json({
+      message: 'Resume rewrite failed',
+    });
+  }
+});
 app.post('/api/resume/upload', upload.single('resume'), async (req, res) => {
   try {
     if (!req.file) {

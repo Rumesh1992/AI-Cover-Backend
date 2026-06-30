@@ -2,26 +2,25 @@ import mongoose from 'mongoose';
 
 const resumeHistorySchema = new mongoose.Schema(
   {
-    targetRole: {
-      type: String,
-      default: '',
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
     },
+
+    targetRole: String,
+
     resumeText: String,
+
     jobDescription: String,
 
     atsScore: Number,
 
-    missingKeywords: {
-      type: [String],
-      default: [],
-    },
+    missingKeywords: [String],
 
     professionalSummary: String,
 
-    skills: {
-      type: [String],
-      default: [],
-    },
+    skills: [String],
 
     coverLetter: String,
   },

@@ -1,22 +1,21 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import OpenAI from 'openai';
-import multer from 'multer';
-import { PDFParse } from 'pdf-parse';
-import mammoth from 'mammoth';
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+import multer from "multer";
+import { PDFParse } from "pdf-parse";
+import mammoth from "mammoth";
+import { Document, Packer, Paragraph, TextRun } from "docx";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
-import connectDB from './config/db.js';
-import ResumeHistory from './models/ResumeHistory.js';
-import {
-  Document,
-  Packer,
-  Paragraph,
-  TextRun,
-} from 'docx';
-import InterviewHistory from './models/InterviewHistory.js';
+import connectDB from "./config/db.js";
+import ResumeHistory from "./models/ResumeHistory.js";
+import InterviewHistory from "./models/InterviewHistory.js";
+import User from "./models/User.js";
+import authMiddleware from "./middleware/authMiddleware.js";
+
 dotenv.config();
-
 connectDB();
 
 const app = express();
@@ -27,35 +26,115 @@ const client = new OpenAI({
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024,
-  },
+  limits: { fileSize: 5 * 1024 * 1024 },
 });
 
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: "2mb" }));
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    success: true,
-    message: 'API running',
-  });
+app.get("/api/health", (req, res) => {
+  res.json({ success: true, message: "API running" });
 });
-app.post('/api/resume/download-docx', async (req, res) => {
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        message: "Name, email and password are required",
+      });
+    }
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      return res.status(400).json({
+        message: "Email already registered",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+      name,
+      email,
+      password: hashedPassword,
+    });
+
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
+
+    return res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error("Register failed:", error);
+    return res.status(500).json({ message: "Register failed" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        message: "Email and password are required",
+      });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(401).json({
+        message: "Invalid email or password",
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        message: "Invalid email or password",
+      });
+    }
+
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
+
+    return res.json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error("Login failed:", error);
+    return res.status(500).json({ message: "Login failed" });
+  }
+});
+
+app.post("/api/resume/download-docx", authMiddleware, async (req, res) => {
   try {
     const { content } = req.body;
 
     const doc = new Document({
       sections: [
         {
-          children: content.split('\n').map(
+          children: content.split("\n").map(
             (line) =>
               new Paragraph({
-                children: [
-                  new TextRun({
-                    text: line,
-                  }),
-                ],
+                children: [new TextRun({ text: line })],
               }),
           ),
         },
@@ -65,109 +144,186 @@ app.post('/api/resume/download-docx', async (req, res) => {
     const buffer = await Packer.toBuffer(doc);
 
     res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
-
     res.setHeader(
-      'Content-Disposition',
-      'attachment; filename=ATS-Optimized-Resume.docx',
+      "Content-Disposition",
+      "attachment; filename=ATS-Optimized-Resume.docx",
     );
 
-    res.send(buffer);
+    return res.send(buffer);
   } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      message: 'DOCX generation failed',
-    });
+    console.error("DOCX generation failed:", error);
+    return res.status(500).json({ message: "DOCX generation failed" });
   }
 });
 
-app.post('/api/interview/generate', async (req, res) => {
+app.post("/api/resume/upload", authMiddleware, upload.single("resume"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "Resume file is required" });
+    }
+
+    let text = "";
+
+    if (req.file.mimetype === "application/pdf") {
+      const parser = new PDFParse({ data: req.file.buffer });
+      const data = await parser.getText();
+      text = data.text?.trim() || "";
+    } else if (
+      req.file.mimetype ===
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ) {
+      const data = await mammoth.extractRawText({ buffer: req.file.buffer });
+      text = data.value?.trim() || "";
+    } else {
+      return res.status(400).json({
+        message: "Only PDF and DOCX files are allowed",
+      });
+    }
+
+    if (!text) {
+      return res.status(400).json({
+        message: "No readable text found in file",
+      });
+    }
+
+    return res.json({ text });
+  } catch (error) {
+    console.error("Resume upload failed:", error);
+    return res.status(500).json({ message: "Failed to read resume file" });
+  }
+});
+
+app.post("/api/resume/generate", authMiddleware, async (req, res) => {
   try {
     const { targetRole, resumeText, jobDescription } = req.body;
 
     if (!resumeText || !jobDescription) {
       return res.status(400).json({
-        message: 'Resume text and job description are required',
+        message: "Resume text and job description are required",
       });
     }
 
     const response = await client.responses.create({
-      model: 'gpt-5.4-mini',
+      model: "gpt-5.4-mini",
       input: `
-You are a senior technical interviewer and career coach.
+You are an expert career coach and ATS resume optimization assistant.
 
 Target role:
-${targetRole || 'Software Engineer'}
+${targetRole || "Software Engineer"}
 
-Candidate resume:
+Resume:
 ${resumeText}
 
 Job description:
 ${jobDescription}
 
-Generate interview questions tailored to this candidate and job.
-
 Return ONLY valid JSON in this exact structure:
 
 {
-  "reactQuestions": [],
-  "typescriptQuestions": [],
-  "systemDesignQuestions": [],
-  "behavioralQuestions": [],
-  "roleSpecificQuestions": []
+  "atsScore": 0,
+  "missingKeywords": [],
+  "professionalSummary": "",
+  "skills": [],
+  "coverLetter": ""
 }
 
 Rules:
-- Each array must contain 5 questions.
-- Questions must be practical and job-relevant.
-- Include questions based on technologies found in resume and job description.
-- Do not include explanations outside JSON.
-- Do not wrap JSON in markdown.
+- atsScore must be a number between 0 and 100
+- missingKeywords must be an array of strings
+- skills must be an array of strings
+- professionalSummary must be plain text
+- coverLetter must be plain text
+- Do not invent fake experience
+- Do not wrap JSON in markdown
+- Do not add explanations outside JSON
 `,
     });
 
     const aiText = response.output_text?.trim();
 
     if (!aiText) {
-      return res.status(500).json({
-        message: 'Empty AI response',
-      });
+      return res.status(500).json({ message: "Empty AI response" });
     }
 
     const parsedResult = JSON.parse(aiText);
 
-    return res.json(parsedResult);
-  } catch (error) {
-    console.error('Interview question generation failed:', error);
-
-    return res.status(500).json({
-      message: 'Interview question generation failed',
+    const savedHistory = await ResumeHistory.create({
+      userId: req.user.userId,
+      targetRole: targetRole || "Software Engineer",
+      resumeText,
+      jobDescription,
+      atsScore: parsedResult.atsScore,
+      missingKeywords: parsedResult.missingKeywords,
+      professionalSummary: parsedResult.professionalSummary,
+      skills: parsedResult.skills,
+      coverLetter: parsedResult.coverLetter,
     });
+
+    return res.json({
+      ...parsedResult,
+      id: savedHistory._id,
+      createdAt: savedHistory.createdAt,
+    });
+  } catch (error) {
+    console.error("AI generation failed:", error);
+    return res.status(500).json({ message: "AI generation failed" });
   }
 });
 
-app.post('/api/resume/rewrite', async (req, res) => {
+app.get("/api/resume/history", authMiddleware, async (req, res) => {
+  try {
+    const history = await ResumeHistory.find({
+      userId: req.user.userId,
+    })
+      .sort({ createdAt: -1 })
+      .limit(20);
+
+    return res.json(history);
+  } catch (error) {
+    console.error("History fetch failed:", error);
+    return res.status(500).json({ message: "Failed to fetch resume history" });
+  }
+});
+
+app.delete("/api/resume/history/:id", authMiddleware, async (req, res) => {
+  try {
+    await ResumeHistory.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user.userId,
+    });
+
+    return res.json({
+      success: true,
+      message: "History item deleted",
+    });
+  } catch (error) {
+    console.error("History delete failed:", error);
+    return res.status(500).json({ message: "Failed to delete history item" });
+  }
+});
+
+app.post("/api/resume/rewrite", authMiddleware, async (req, res) => {
   try {
     const { targetRole, resumeText, jobDescription, resumeTemplate } = req.body;
 
     if (!resumeText || !jobDescription) {
       return res.status(400).json({
-        message: 'Resume text and job description are required',
+        message: "Resume text and job description are required",
       });
     }
 
-    const templateStyle = resumeTemplate || 'ats';
+    const templateStyle = resumeTemplate || "ats";
 
     const response = await client.responses.create({
-      model: 'gpt-5.4-mini',
+      model: "gpt-5.4-mini",
       input: `
 You are an expert ATS resume writer and senior technical recruiter.
 
 Target role:
-${targetRole || 'Software Engineer'}
+${targetRole || "Software Engineer"}
 
 Resume template style:
 ${templateStyle}
@@ -225,182 +381,126 @@ EDUCATION & CERTIFICATIONS
     const rewrittenResume = response.output_text?.trim();
 
     if (!rewrittenResume) {
-      return res.status(500).json({
-        message: 'Empty AI response',
-      });
+      return res.status(500).json({ message: "Empty AI response" });
     }
 
-    return res.json({
-      rewrittenResume,
-    });
+    return res.json({ rewrittenResume });
   } catch (error) {
-    console.error('Resume rewrite failed:', error);
-
-    return res.status(500).json({
-      message: 'Resume rewrite failed',
-    });
-  }
-});
-app.post('/api/resume/upload', upload.single('resume'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        message: 'Resume file is required',
-      });
-    }
-
-    let text = '';
-
-    if (req.file.mimetype === 'application/pdf') {
-      const parser = new PDFParse({
-        data: req.file.buffer,
-      });
-
-      const data = await parser.getText();
-      text = data.text?.trim() || '';
-    } else if (
-      req.file.mimetype ===
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ) {
-      const data = await mammoth.extractRawText({
-        buffer: req.file.buffer,
-      });
-
-      text = data.value?.trim() || '';
-    } else {
-      return res.status(400).json({
-        message: 'Only PDF and DOCX files are allowed',
-      });
-    }
-
-    if (!text) {
-      return res.status(400).json({
-        message: 'No readable text found in file',
-      });
-    }
-
-    return res.json({
-      text,
-    });
-  } catch (error) {
-    console.error('Resume upload failed:', error);
-
-    return res.status(500).json({
-      message: 'Failed to read resume file',
-    });
+    console.error("Resume rewrite failed:", error);
+    return res.status(500).json({ message: "Resume rewrite failed" });
   }
 });
 
-app.post('/api/resume/generate', async (req, res) => {
+app.post("/api/interview/generate", authMiddleware, async (req, res) => {
   try {
     const { targetRole, resumeText, jobDescription } = req.body;
 
     if (!resumeText || !jobDescription) {
       return res.status(400).json({
-        message: 'Resume text and job description are required',
+        message: "Resume text and job description are required",
       });
     }
 
     const response = await client.responses.create({
-      model: 'gpt-5.4-mini',
+      model: "gpt-5.4-mini",
       input: `
-You are an expert career coach and ATS resume optimization assistant.
+You are a senior technical interviewer and career coach.
 
 Target role:
-${targetRole || 'Software Engineer'}
+${targetRole || "Software Engineer"}
 
-Resume:
+Candidate resume:
 ${resumeText}
 
 Job description:
 ${jobDescription}
 
+Generate interview questions tailored to this candidate and job.
+
 Return ONLY valid JSON in this exact structure:
 
 {
-  "atsScore": 0,
-  "missingKeywords": [],
-  "professionalSummary": "",
-  "skills": [],
-  "coverLetter": ""
+  "reactQuestions": [],
+  "typescriptQuestions": [],
+  "systemDesignQuestions": [],
+  "behavioralQuestions": [],
+  "roleSpecificQuestions": []
 }
 
 Rules:
-- atsScore must be a number between 0 and 100
-- missingKeywords must be an array of strings
-- skills must be an array of strings
-- professionalSummary must be plain text
-- coverLetter must be plain text
-- Do not invent fake experience
-- Do not wrap JSON in markdown
-- Do not add explanations outside JSON
+- Each array must contain 5 questions.
+- Questions must be practical and job-relevant.
+- Include questions based on technologies found in resume and job description.
+- Do not include explanations outside JSON.
+- Do not wrap JSON in markdown.
 `,
     });
 
     const aiText = response.output_text?.trim();
 
     if (!aiText) {
-      return res.status(500).json({
-        message: 'Empty AI response',
-      });
+      return res.status(500).json({ message: "Empty AI response" });
     }
 
     const parsedResult = JSON.parse(aiText);
 
-    const savedHistory = await ResumeHistory.create({
-      targetRole: targetRole || 'Software Engineer',
+    const savedInterview = await InterviewHistory.create({
+      userId: req.user.userId,
+      targetRole: targetRole || "Software Engineer",
       resumeText,
       jobDescription,
-      atsScore: parsedResult.atsScore,
-      missingKeywords: parsedResult.missingKeywords,
-      professionalSummary: parsedResult.professionalSummary,
-      skills: parsedResult.skills,
-      coverLetter: parsedResult.coverLetter,
+      reactQuestions: parsedResult.reactQuestions,
+      typescriptQuestions: parsedResult.typescriptQuestions,
+      systemDesignQuestions: parsedResult.systemDesignQuestions,
+      behavioralQuestions: parsedResult.behavioralQuestions,
+      roleSpecificQuestions: parsedResult.roleSpecificQuestions,
     });
 
     return res.json({
       ...parsedResult,
-      id: savedHistory._id,
-      createdAt: savedHistory.createdAt,
+      id: savedInterview._id,
+      createdAt: savedInterview.createdAt,
     });
   } catch (error) {
-    console.error('AI generation failed:', error);
-
+    console.error("Interview question generation failed:", error);
     return res.status(500).json({
-      message: 'AI generation failed',
+      message: "Interview question generation failed",
     });
   }
 });
 
-app.get('/api/resume/history', async (req, res) => {
+app.get("/api/interview/history", authMiddleware, async (req, res) => {
   try {
-    const history = await ResumeHistory.find()
+    const history = await InterviewHistory.find({
+      userId: req.user.userId,
+    })
       .sort({ createdAt: -1 })
       .limit(20);
 
     return res.json(history);
   } catch (error) {
-    console.error('History fetch failed:', error);
-
+    console.error("Interview history fetch failed:", error);
     return res.status(500).json({
-      message: 'Failed to fetch resume history',
+      message: "Failed to fetch interview history",
     });
   }
 });
 
-app.delete('/api/resume/history/:id', async (req, res) => {
+app.delete("/api/interview/history/:id", authMiddleware, async (req, res) => {
   try {
-    await ResumeHistory.findByIdAndDelete(req.params.id);
+    await InterviewHistory.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user.userId,
+    });
 
     return res.json({
       success: true,
-      message: 'History item deleted',
+      message: "Interview history item deleted",
     });
   } catch (error) {
-    console.error('History delete failed:', error);
-
+    console.error("Interview history delete failed:", error);
     return res.status(500).json({
-      message: 'Failed to delete history item',
+      message: "Failed to delete interview history item",
     });
   }
 });
